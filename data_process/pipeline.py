@@ -1,8 +1,6 @@
 import pandas as pd
 
-
-df = pd.read_csv(r"D:\社会计算\taobao-project\data\processed\chain.csv")
-
+df = pd.read_csv(r"D:\\社会计算\\taobao-project\\data\\processed\\chained.csv")
 
 inter_df = df[["user_id", "item_id", "behavior_type", "timestamp"]].copy()
 inter_df = inter_df.rename(columns={"behavior_type": "label"})
