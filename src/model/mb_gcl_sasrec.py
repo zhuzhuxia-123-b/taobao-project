@@ -15,6 +15,11 @@ mb_gcl_sasrec.py — 主模型 MB-GCL-SASRec
   predict(interaction)        → [B] 分数           （评估用）
   full_sort_predict(interaction) → [B, n_items]   （全量排序，RecBole 评估用）
   get_hidden_state(interaction)  → [B, d]         （D同学做漂移分析用）
+
+设备策略（自动适配，无需手动配置）：
+  item_emb / user_emb_table 体积巨大（百万级物品），当其大小超过可用显存的
+  40% 时自动留在 CPU；其余参数随 .to(device) 正常迁移。
+  所有前向计算会在正确设备间自动搬运，对调用方透明。
 """
 
 import math
@@ -65,13 +70,10 @@ class _SASRecLayer(nn.Module):
 
         返回 [B, L, d]
         """
-        # 自注意力 + 残差
         residual = x
         x_norm   = self.norm1(x)
         attn_out, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=attn_mask)
         x = residual + self.dropout(attn_out)
-
-        # FFN + 残差
         x = x + self.dropout(self.ffn(self.norm2(x)))
         return x
 
@@ -106,8 +108,8 @@ class MBGCLSASRec(_Base):
             super().__init__()
 
         # ── 从 config 读超参数 ──────────────────────────
-        self.n_users = config.get("n_users",    1018012)
-        self.n_items     = config.get("n_items",     5163071)
+        self.n_users     = config.get("n_users",     987994)
+        self.n_items     = config.get("n_items",     4162024)
         d                = config.get("embed_dim",   64)
         self.embed_dim   = d
         n_layers         = config.get("n_layers",    2)
@@ -158,6 +160,23 @@ class MBGCLSASRec(_Base):
 
         self._init_weights()
 
+        # ── 大型嵌入表设备策略（自动检测，无需手动配置）──
+        # item_emb / user_emb_table 体积 = n_items * embed_dim * 4 bytes
+        # 若超过可用显存的 40%，自动留在 CPU，其余模型正常放 GPU
+        # 在 CPU 上训练时此逻辑不触发，行为与原来完全一致
+        emb_mb = (self.n_items + 1) * d * 4 / 1e6
+        use_cpu_emb = False
+        if torch.cuda.is_available():
+            free_mb = torch.cuda.mem_get_info()[0] / 1e6
+            if emb_mb > free_mb * 0.4:
+                use_cpu_emb = True
+                print(f"[MBGCLSASRec] item_emb ({emb_mb:.0f}MB) 超过可用显存40%"
+                      f"（{free_mb:.0f}MB），自动留在 CPU。")
+        self._large_emb_on_cpu = use_cpu_emb
+        if use_cpu_emb:
+            self.behavior_emb.item_emb = self.behavior_emb.item_emb.cpu()
+            self.user_emb_table = self.user_emb_table.cpu()
+
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Embedding):
@@ -168,62 +187,113 @@ class MBGCLSASRec(_Base):
                     nn.init.zeros_(m.bias)
 
     # ──────────────────────────────────────────────────────────────────
-    # 公开接口：加载图（训练前调用一次）
+    # 内部工具：获取模型主体所在设备（attn_layers 一定在主设备上）
+    # ──────────────────────────────────────────────────────────────────
+
+    @property
+    def _main_device(self) -> torch.device:
+        return next(self.attn_layers.parameters()).device
+
+    def _to_main(self, t: torch.Tensor) -> torch.Tensor:
+        """把张量搬到模型主体设备。"""
+        return t.to(self._main_device)
+
+    def _item_lookup(self, ids: torch.LongTensor) -> torch.Tensor:
+        """
+        查 item_emb，自动处理 CPU/GPU 分离。
+        ids 可以在任意设备，返回结果与模型主体同设备。
+        """
+        emb = self.behavior_emb.item_emb(ids.cpu() if self._large_emb_on_cpu else ids)
+        return self._to_main(emb)
+
+    # ──────────────────────────────────────────────────────────────────
+    # 公开接口：加载图 + 预计算图卷积缓存
     # ──────────────────────────────────────────────────────────────────
 
     def load_graphs(self, graphs: list):
+        """
+        加载 A同学的三张图。训练前调用一次。
+
+        示例
+        ----
+        import scipy.sparse as sp
+        graphs = [
+            sp.load_npz('data/processed/B/graph_pv.npz'),
+            sp.load_npz('data/processed/B/graph_cart.npz'),
+            sp.load_npz('data/processed/B/graph_buy.npz'),
+        ]
+        model.load_graphs(graphs)
+        model.update_graph_emb()   # 紧接着调用，预计算 GCN 缓存
+        """
         self.graph_conv.load_graphs(graphs)
 
+    @torch.no_grad()
+    def update_graph_emb(self):
+        """
+        预计算图卷积增强嵌入并缓存，避免每个 batch 重复计算。
+        每个 epoch 开始前调用一次即可。
+
+        图卷积在 CPU 上计算（图本身是 CPU sparse tensor），
+        结果缓存到 CPU，forward 时按需搬到主设备。
+        """
+        if not self.graph_conv._graphs_loaded:
+            return
+
+        # 嵌入表和图卷积都在 CPU 上，统一在 CPU 计算
+        graph_conv_cpu = self.graph_conv.cpu()
+        all_user_emb   = self.user_emb_table.weight[1:].cpu()      # [n_users, d]
+        all_item_emb   = self.behavior_emb.item_emb.weight[1:].cpu()  # [n_items, d]
+
+        u_enh, i_enh = graph_conv_cpu(all_user_emb, all_item_emb)
+
+        # 补 padding 行（index 0），对齐 item_id 从 1 开始
+        pad = torch.zeros(1, i_enh.size(-1), dtype=i_enh.dtype)
+        self._i_enh_cache = torch.cat([pad, i_enh], dim=0).detach()  # [n_items+1, d] CPU
+        self._u_enh_cache = u_enh.detach()                            # [n_users, d]   CPU
+        print("[MBGCLSASRec] 图卷积缓存已更新。")
+
     # ──────────────────────────────────────────────────────────────────
-    # 内部：编码序列 → 返回所有层的隐状态
+    # 内部：编码序列 → 返回所有位置的隐状态
     # ──────────────────────────────────────────────────────────────────
 
     def _encode_sequence(
         self,
-        item_seq:      torch.LongTensor,    # [B, L]
-        behavior_seq:  torch.LongTensor,    # [B, L]  0=pv,1=cart,2=buy
-        seq_len:       torch.LongTensor,    # [B]     实际有效长度
+        item_seq:      torch.LongTensor,          # [B, L]
+        behavior_seq:  torch.LongTensor,          # [B, L]  0=pv,1=cart,2=buy
+        seq_len:       torch.LongTensor,          # [B]     实际有效长度
         weights:       torch.FloatTensor = None,  # [B, L]
-        user_ids:      torch.LongTensor = None,   # [B]
+        user_ids:      torch.LongTensor  = None,  # [B]
     ) -> torch.Tensor:
-        """
-        返回 [B, L, d]：序列中每个位置的隐状态。
-        """
+        """返回 [B, L, d]：序列中每个位置的隐状态。"""
         B, L = item_seq.shape
 
         # ── 行为感知嵌入 ───────────────────────────────
-        seq_emb = self.behavior_emb(item_seq, behavior_seq, weights)  # [B, L, d]
+        # item_emb 可能在 CPU，先在 CPU 取嵌入再搬到主设备
+        if self._large_emb_on_cpu:
+            seq_emb = self.behavior_emb(item_seq.cpu(), behavior_seq.cpu(),
+                                        weights.cpu() if weights is not None else None)
+            seq_emb = self._to_main(seq_emb)                        # [B, L, d]
+        else:
+            seq_emb = self.behavior_emb(item_seq, behavior_seq, weights)  # [B, L, d]
 
-        # ── 图卷积增强 ─────────────────────────────────
-        if self.graph_conv._graphs_loaded and user_ids is not None:
-            # 全量用户/物品嵌入送入图卷积
-            all_user_emb = self.user_emb_table.weight[1:]   # [n_users, d]
-            all_item_emb = self.behavior_emb.item_emb.weight[1:]  # [n_items, d]
+        # ── 图卷积增强（查缓存，不重新计算）─────────
+        if self.graph_conv._graphs_loaded and hasattr(self, "_i_enh_cache"):
+            # 缓存在 CPU，查完再搬到主设备
+            i_enh_seq = F.embedding(item_seq.cpu(), self._i_enh_cache)
+            i_enh_seq = self._to_main(i_enh_seq)                    # [B, L, d]
 
-            u_enh, i_enh = self.graph_conv(all_user_emb, all_item_emb)
-            # [n_users, d]  [n_items, d]
-
-            # 取出当前 batch 中物品的图增强嵌入
-            i_enh = torch.cat(
-                [torch.zeros(1, i_enh.size(-1), device=i_enh.device), i_enh], dim=0
-            )  # [n_items+1, d]
-            i_enh_seq = F.embedding(item_seq, i_enh)  # [B, L, d]
-
-            # 门控融合：原始嵌入 + 图增强嵌入
-            gate = self.graph_gate(
-                torch.cat([seq_emb, i_enh_seq], dim=-1)
-            )                                                # [B, L, d]
-            seq_emb = seq_emb + gate * i_enh_seq            # [B, L, d]
+            gate    = self.graph_gate(torch.cat([seq_emb, i_enh_seq], dim=-1))
+            seq_emb = seq_emb + gate * i_enh_seq                    # [B, L, d]
 
         # ── 位置编码 ───────────────────────────────────
-        positions = torch.arange(1, L + 1, device=item_seq.device)  # [L]
+        positions = torch.arange(1, L + 1, device=self._main_device)
         seq_emb   = seq_emb + self.pos_emb(positions.unsqueeze(0))  # [B, L, d]
 
         # ── SASRec 因果自注意力 ────────────────────────
-        mask = self.causal_mask[:L, :L]                     # [L, L]
+        mask = self.causal_mask[:L, :L]
         h    = seq_emb
         for layer in self.attn_layers:
-            h = layer(h, attn_mask=mask)                    # [B, L, d]
+            h = layer(h, attn_mask=mask)
 
         h = self.final_norm(h)
         return h  # [B, L, d]
@@ -237,11 +307,9 @@ class MBGCLSASRec(_Base):
         user_ids:     torch.LongTensor  = None,
     ) -> torch.Tensor:
         """取出每个样本最后一个有效位置的隐状态 → [B, d]。"""
-        h = self._encode_sequence(item_seq, behavior_seq, seq_len, weights, user_ids)
-        # seq_len 记录有效长度，取对应位置（1-indexed → 0-indexed）
-        idx = (seq_len - 1).clamp(0, h.size(1) - 1)       # [B]
-        h_last = h[torch.arange(h.size(0), device=h.device), idx]  # [B, d]
-        return h_last
+        h   = self._encode_sequence(item_seq, behavior_seq, seq_len, weights, user_ids)
+        idx = (seq_len.to(self._main_device) - 1).clamp(0, h.size(1) - 1)
+        return h[torch.arange(h.size(0), device=self._main_device), idx]  # [B, d]
 
     # ──────────────────────────────────────────────────────────────────
     # 公开接口：D同学用于提取隐状态（漂移分析）
@@ -251,6 +319,26 @@ class MBGCLSASRec(_Base):
     def get_hidden_state(self, interaction: dict) -> torch.Tensor:
         """
         提取用户最终隐状态，供 D同学做兴趣漂移分析。
+
+        参数
+        ----
+        interaction : dict，至少包含：
+            "item_seq"       : LongTensor [B, L]
+            "behavior_seq"   : LongTensor [B, L]
+            "item_seq_len"   : LongTensor [B]
+            "weights"        : FloatTensor [B, L]（可选）
+            "user_id"        : LongTensor [B]（可选）
+
+        返回
+        ----
+        h_last : FloatTensor [B, embed_dim]
+
+        用法示例（D同学）
+        ----
+        model.load_state_dict(torch.load('best_model.pth'))
+        model.eval()
+        h = model.get_hidden_state(interaction)   # [B, d]
+        drift = torch.norm(h[1:] - h[:-1], dim=-1)  # 相邻时刻的漂移距离
         """
         self.eval()
         return self._get_last_hidden(
@@ -267,7 +355,19 @@ class MBGCLSASRec(_Base):
 
     def calculate_loss(self, interaction: dict) -> dict:
         """
-        计算三路联合损失
+        计算三路联合损失。
+
+        interaction 必须包含：
+            item_seq       : [B, L]
+            behavior_seq   : [B, L]
+            item_seq_len   : [B]
+            pos_item_id    : [B]    正样本物品 ID
+            neg_item_id    : [B]    负样本物品 ID（BPR 用）
+
+        可选：
+            weights        : [B, L]   A同学的 weight_final
+            user_id        : [B]
+            closure_label  : [B]      A同学的 closure_label（0/1）
         """
         item_seq     = interaction["item_seq"]
         behavior_seq = interaction["behavior_seq"]
@@ -277,37 +377,38 @@ class MBGCLSASRec(_Base):
         weights      = interaction.get("weights")
         user_ids     = interaction.get("user_id")
 
-        # 强视图：完整序列（含 buy/cart），即 item_seq 本身
+        # 强视图：完整序列（含 buy/cart）
         h_strong = self._get_last_hidden(item_seq, behavior_seq, seq_len, weights, user_ids)
 
-        # 弱视图：仅保留 pv 行为（behavior_type == 0），其他位置置为 padding
+        # 弱视图：仅保留 pv 行为，非 pv 且非 padding 的位置置为 0
         pv_mask = (behavior_seq == 0) & (item_seq != 0)
-        pv_seq    = item_seq * pv_mask.long()          # 非 pv 位置变为 0
-        pv_beh    = torch.zeros_like(behavior_seq)
-        pv_len    = pv_mask.sum(dim=1).clamp(min=1)   # 至少 1
-        h_weak    = self._get_last_hidden(pv_seq, pv_beh, pv_len, None, user_ids)
+        pv_seq  = item_seq * pv_mask.long()
+        pv_beh  = torch.zeros_like(behavior_seq)
+        pv_len  = pv_mask.sum(dim=1).clamp(min=1)
+        h_weak  = self._get_last_hidden(pv_seq, pv_beh, pv_len, None, user_ids)
 
-        # 评分（内积）
-        all_item_emb = self.behavior_emb.item_emb.weight  # [n_items+1, d]
-        pos_emb      = all_item_emb[pos_ids]               # [B, d]
-        neg_emb      = all_item_emb[neg_ids]               # [B, d]
-        pos_scores   = (h_strong * pos_emb).sum(-1)        # [B]
-        neg_scores   = (h_strong * neg_emb).sum(-1)        # [B]
+        # 评分（内积）— item_emb 可能在 CPU，统一用 _item_lookup
+        pos_emb    = self._item_lookup(pos_ids)                     # [B, d]
+        neg_emb    = self._item_lookup(neg_ids)                     # [B, d]
+        pos_scores = (h_strong * pos_emb).sum(-1)                   # [B]
+        neg_scores = (h_strong * neg_emb).sum(-1)                   # [B]
 
         # 需求闭合 logit
-        closure_logits = self.closure_head(h_strong).squeeze(-1)  # [B]
+        closure_logits = self.closure_head(h_strong).squeeze(-1)    # [B]
         closure_labels = interaction.get("closure_label")
+        if closure_labels is not None:
+            closure_labels = closure_labels.to(self._main_device)
 
         return combined_loss(
-            pos_scores      = pos_scores,
-            neg_scores      = neg_scores,
-            closure_logits  = closure_logits,
-            closure_labels  = closure_labels,
-            h_strong        = h_strong,
-            h_weak          = h_weak,
-            lambda1         = self.lambda1,
-            lambda2         = self.lambda2,
-            temperature     = self.temperature,
+            pos_scores     = pos_scores,
+            neg_scores     = neg_scores,
+            closure_logits = closure_logits,
+            closure_labels = closure_labels,
+            h_strong       = h_strong,
+            h_weak         = h_weak,
+            lambda1        = self.lambda1,
+            lambda2        = self.lambda2,
+            temperature    = self.temperature,
         )
 
     # ──────────────────────────────────────────────────────────────────
@@ -316,9 +417,7 @@ class MBGCLSASRec(_Base):
 
     def predict(self, interaction: dict) -> torch.Tensor:
         """
-        对指定物品打分。
-
-        返回 [B] 分数（值越高越推荐）
+        对指定物品打分。返回 [B] 分数（值越高越推荐）。
         """
         item_seq     = interaction["item_seq"]
         behavior_seq = interaction["behavior_seq"]
@@ -327,16 +426,13 @@ class MBGCLSASRec(_Base):
         weights      = interaction.get("weights")
         user_ids     = interaction.get("user_id")
 
-        h_last   = self._get_last_hidden(item_seq, behavior_seq, seq_len, weights, user_ids)
-        tgt_emb  = self.behavior_emb.item_emb(target_ids)  # [B, d]
-        scores   = (h_last * tgt_emb).sum(-1)              # [B]
-        return scores
+        h_last  = self._get_last_hidden(item_seq, behavior_seq, seq_len, weights, user_ids)
+        tgt_emb = self._item_lookup(target_ids)                     # [B, d]
+        return (h_last * tgt_emb).sum(-1)                           # [B]
 
     def full_sort_predict(self, interaction: dict) -> torch.Tensor:
         """
-        对所有物品打分（RecBole 评估 Hit/NDCG 用）。
-
-        返回 [B, n_items] 分数矩阵
+        对所有物品打分（RecBole 评估 Hit/NDCG 用）。返回 [B, n_items]。
         """
         item_seq     = interaction["item_seq"]
         behavior_seq = interaction["behavior_seq"]
@@ -344,7 +440,9 @@ class MBGCLSASRec(_Base):
         weights      = interaction.get("weights")
         user_ids     = interaction.get("user_id")
 
-        h_last       = self._get_last_hidden(item_seq, behavior_seq, seq_len, weights, user_ids)
-        all_item_emb = self.behavior_emb.item_emb.weight[1:]  # [n_items, d]（去掉 padding）
-        scores       = h_last @ all_item_emb.T                # [B, n_items]
-        return scores
+        h_last = self._get_last_hidden(item_seq, behavior_seq, seq_len, weights, user_ids)
+
+        # 全量 item_emb，去掉 padding 行
+        all_item_emb = self.behavior_emb.item_emb.weight[1:]        # CPU 或 GPU
+        all_item_emb = self._to_main(all_item_emb)                  # 搬到主设备
+        return h_last @ all_item_emb.T                              # [B, n_items]

@@ -77,9 +77,7 @@ class MultiBehaviorGraphConv(nn.Module):
         """
         assert len(graphs) == 3, "需要传入 pv / cart / buy 三张图"
         for g, name in zip(graphs, self.BEHAVIOR_NAMES):
-            # ── 新增：把 A同学的方阵转成 (n_users, n_items) 矩形图 ──
-            rect = self._to_rect(g, self.n_users, self.n_items)
-            norm = self._build_norm_graph(rect)
+            norm = self._build_norm_graph(g.tocsr(), self.n_users, self.n_items)
             self.register_buffer(f"graph_{name}", norm)
         self._graphs_loaded = True
         print(f"[GraphConv] 图加载完成，n_users={self.n_users}, n_items={self.n_items}")
@@ -102,39 +100,37 @@ class MultiBehaviorGraphConv(nn.Module):
         )
 
     @staticmethod
-    def _build_norm_graph(adj: sp.csr_matrix) -> torch.Tensor:
-        """
-        LightGCN 对称归一化，并拼成双向二部图。
+    def _build_norm_graph(adj: sp.csr_matrix, n_users: int, n_items: int) -> torch.Tensor:
+        # 统一尺寸
+        if adj.shape != (n_users, n_items):
+            adj = adj.tocoo()
+            adj = sp.csr_matrix(
+                (adj.data, (adj.row, adj.col)),
+                shape=(n_users, n_items)
+            )
 
-        原始图 adj 是 (n_u, n_i) 的用户-物品矩阵，
-        拼成 (n_u+n_i, n_u+n_i) 的对称二部图：
-            [[  0  ,  adj  ],
-             [adj^T,   0   ]]
+        n = n_users + n_items
+        adj = adj.tocoo().astype(np.float32)
 
-        归一化：Â = D^{-1/2} · A_sym · D^{-1/2}
-        """
-        n_u, n_i = adj.shape
-        n = n_u + n_i
+        # 手动拼二部图，避免 sp.bmat 的内存峰值
+        # 上半：user->item 边，行偏移0，列偏移n_users
+        # 下半：item->user 边，行偏移n_users，列偏移0
+        rows = np.concatenate([adj.row, adj.col + n_users])
+        cols = np.concatenate([adj.col + n_users, adj.row])
+        data = np.concatenate([adj.data, adj.data])
 
-        # 构造对称二部图
-        adj_sym = sp.bmat(
-            [[None, adj], [adj.T, None]], format="csr"
-        ).astype(np.float32)
+        # 度归一化
+        deg = np.zeros(n, dtype=np.float32)
+        np.add.at(deg, rows, data)
+        deg[deg == 0] = 1.0
+        d_inv_sqrt = deg ** -0.5
 
-        # 度矩阵 D^{-1/2}
-        deg = np.array(adj_sym.sum(axis=1)).flatten()
-        deg[deg == 0] = 1.0                          # 避免除零
-        d_inv_sqrt = sp.diags(deg ** -0.5)
+        # 归一化边权重
+        data = data * d_inv_sqrt[rows] * d_inv_sqrt[cols]
 
-        # Â = D^{-1/2} A D^{-1/2}
-        norm_adj = d_inv_sqrt @ adj_sym @ d_inv_sqrt  # still sparse
-
-        # 转成 PyTorch 稀疏 COO Tensor
-        coo = norm_adj.tocoo()
-        indices = torch.from_numpy(np.vstack([coo.row, coo.col])).long()
-        values  = torch.from_numpy(coo.data)
+        indices = torch.from_numpy(np.vstack([rows, cols]).astype(np.int64))
+        values = torch.from_numpy(data)
         return torch.sparse_coo_tensor(indices, values, (n, n)).coalesce()
-
     # ------------------------------------------------------------------
     # 前向传播
     # ------------------------------------------------------------------
