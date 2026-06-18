@@ -1,0 +1,50 @@
+# 消融 G：去掉需求闭合损失（λ2=0）
+# 用途：验证 BCE 需求闭合损失的贡献
+
+model: MBGCLSASRec
+dataset: taobao
+data_path: data_process/processed/
+
+# CPU 专属配置
+use_gpu: True
+gpu_id: 0
+worker: 0
+USER_ID_FIELD: user_id
+ITEM_ID_FIELD: item_id
+LABEL_FIELD: label
+TIME_FIELD: timestamp
+field_separator: "\t"
+# 原有内容替换成下面
+load_col:
+  inter: [user_id, item_id, label, weight, timestamp, closure, behavior]
+MAX_ITEM_LIST_LENGTH: 50
+embed_dim: 64
+n_layers: 2
+n_heads: 2
+max_seq_len: 50
+graph_layers: 2
+dropout: 0.1
+
+# 关键区别：λ2=0，关闭需求闭合损失
+lambda1: 0.1
+lambda2: 0.0
+temperature: 0.07
+
+graph_pv_path:   data_process/processed/taobao/graph_pv.npz
+graph_cart_path: data_process/processed/taobao/graph_cart.npz
+graph_buy_path:  data_process/processed/taobao/graph_buy.npz
+eval_args:
+  split: {RS: [0.8, 0.1, 0.1]}
+  order: TO
+  group_by: user
+  mode: {valid: uni10, test: uni10}
+metrics: [NDCG, Hit, Recall]
+topk: [10]
+valid_metric: NDCG@10
+epochs: 30
+train_batch_size: 2048
+eval_batch_size: 512
+learning_rate: 0.001
+stopping_step: 10
+log_wandb: False
+show_progress: True

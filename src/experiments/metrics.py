@@ -1,87 +1,200 @@
 """
-NSR（需求满足率）评估指标
-C同学实现
-输入：模型推荐的Top-K列表 + 用户的closure_label标签
-输出：推荐Top-K中最终促成需求闭合（buy）的商品比例
+metrics.py — 自定义评估指标
+=============================
+
+包含两个指标：
+  1. NeedSatisfactionRate (NSR)：需求满足率（原创指标）
+  2. 标准指标包装：NDCG@K, Hit@K（方便在 run_ablation.py 里统一调用）
+
+NSR 定义：
+  推荐列表 Top-K 中，closure_label=1（用户最终购买）的商品占比。
+  衡量"模型推荐的东西，用户真的会买"的比例。
+  值域 [0, 1]，越高越好。
+
+closure_label=1 代表已购买（已闭合），来自 chained_clean.csv，已确认。
 """
 
+import torch
 import numpy as np
-import pandas as pd
+from typing import List, Union
 
 
-def compute_nsr(
-    recommended_items: list,
-    closure_labels: dict,
+# ==========================================================================
+# 1. NSR：需求满足率
+# ==========================================================================
+
+def need_satisfaction_rate(
+    recommended_items: Union[torch.Tensor, np.ndarray, List],
+    closure_labels:    Union[torch.Tensor, np.ndarray, List],
     k: int = 10,
 ) -> float:
     """
-    计算NSR@K
+    计算需求满足率 NSR@K。
 
-    Args:
-        recommended_items: 每个用户的Top-K推荐列表 List[List[item_id]]
-        closure_labels:    每个用户最终发生buy的商品集合 Dict[user_idx -> Set[item_id]]
-        k:                 评估截断位置
+    参数
+    ----
+    recommended_items : [B, K] 或 [K]
+        模型推荐的 Top-K 物品 ID 列表。
+        如果是二维 [B, K]，则计算 batch 平均值。
 
-    Returns:
-        float: NSR@K均值（0-1之间）
+    closure_labels : dict 或 array-like
+        每个 item_id 对应的 closure_label 值。
+        两种传入格式均支持：
+          - dict：{item_idx: label}
+          - array/tensor：下标即为 item_idx，值为 label
+        closure_label=1 代表已购买（闭合）。
+
+    k : int
+        取 Top-K，默认 10。
+
+    返回
+    ----
+    nsr : float，值域 [0, 1]
     """
-    nsr_list = []
-    for user_idx, rec_list in enumerate(recommended_items):
-        top_k = rec_list[:k]
-        closed = closure_labels.get(user_idx, set())
-        if len(top_k) == 0:
-            continue
-        hits = sum(1 for item in top_k if item in closed)
-        nsr_list.append(hits / len(top_k))
+    # ── 统一转为 numpy ────────────────────────────────────────────
+    if isinstance(recommended_items, torch.Tensor):
+        recommended_items = recommended_items.cpu().numpy()
+    else:
+        recommended_items = np.array(recommended_items)
 
-    return float(np.mean(nsr_list)) if nsr_list else 0.0
+    # ── 处理 closure_labels 的两种格式 ───────────────────────────
+    if isinstance(closure_labels, dict):
+        label_lookup = closure_labels
+    else:
+        if isinstance(closure_labels, torch.Tensor):
+            closure_labels = closure_labels.cpu().numpy()
+        else:
+            closure_labels = np.array(closure_labels)
+        label_lookup = {i: int(closure_labels[i]) for i in range(len(closure_labels))}
+
+    # ── 计算 NSR ─────────────────────────────────────────────────
+    if recommended_items.ndim == 1:
+        # 单用户
+        top_k_items = recommended_items[:k]
+        satisfied = sum(
+            1 for item_id in top_k_items
+            if label_lookup.get(int(item_id), 0) == 1
+        )
+        return satisfied / max(len(top_k_items), 1)
+
+    else:
+        # batch [B, K]
+        batch_nsr = []
+        for user_recs in recommended_items:
+            top_k_items = user_recs[:k]
+            satisfied = sum(
+                1 for item_id in top_k_items
+                if label_lookup.get(int(item_id), 0) == 1
+            )
+            batch_nsr.append(satisfied / max(len(top_k_items), 1))
+        return float(np.mean(batch_nsr))
 
 
-def build_closure_labels(chain_csv_path: str) -> dict:
+# ==========================================================================
+# 2. NDCG@K
+# ==========================================================================
+
+def ndcg_at_k(
+    recommended_items: Union[torch.Tensor, np.ndarray],
+    ground_truth_items: Union[torch.Tensor, np.ndarray],
+    k: int = 10,
+) -> float:
     """
-    从chain_clean.csv构建闭合标签字典
+    计算 NDCG@K。
 
-    Args:
-        chain_csv_path: chain_clean.csv的路径
+    参数
+    ----
+    recommended_items  : [B, N_items] 按分数降序排列的物品 ID
+    ground_truth_items : [B] 每个用户真实交互的物品 ID
+    k                  : Top-K
 
-    Returns:
-        Dict[user_id -> Set[item_id]]
+    返回
+    ----
+    ndcg : float，值域 [0, 1]
     """
-    df = pd.read_csv(chain_csv_path)
-    closed = df[df['closure_label'] == 1]
+    if isinstance(recommended_items, torch.Tensor):
+        recommended_items = recommended_items.cpu().numpy()
+    if isinstance(ground_truth_items, torch.Tensor):
+        ground_truth_items = ground_truth_items.cpu().numpy()
 
-    labels = {}
-    for row in closed.itertuples():
-        uid = int(row.user_id)
-        iid = int(row.item_id)
-        labels.setdefault(uid, set()).add(iid)
+    ndcg_list = []
+    for recs, gt in zip(recommended_items, ground_truth_items):
+        top_k = recs[:k]
+        if gt in top_k:
+            rank = np.where(top_k == gt)[0][0] + 1  # 1-indexed
+            ndcg_list.append(1.0 / np.log2(rank + 1))
+        else:
+            ndcg_list.append(0.0)
 
-    return labels
+    return float(np.mean(ndcg_list))
 
 
-def compute_nsr_by_group(
-    recommended_items: list,
-    closure_labels: dict,
-    user_groups: dict,
+# ==========================================================================
+# 3. Hit@K
+# ==========================================================================
+
+def hit_at_k(
+    recommended_items: Union[torch.Tensor, np.ndarray],
+    ground_truth_items: Union[torch.Tensor, np.ndarray],
+    k: int = 10,
+) -> float:
+    """
+    计算 Hit@K（命中率）。
+
+    参数
+    ----
+    recommended_items  : [B, N_items] 按分数降序排列的物品 ID
+    ground_truth_items : [B] 每个用户真实交互的物品 ID
+    k                  : Top-K
+
+    返回
+    ----
+    hit_rate : float，值域 [0, 1]
+    """
+    if isinstance(recommended_items, torch.Tensor):
+        recommended_items = recommended_items.cpu().numpy()
+    if isinstance(ground_truth_items, torch.Tensor):
+        ground_truth_items = ground_truth_items.cpu().numpy()
+
+    hits = [
+        1 if gt in recs[:k] else 0
+        for recs, gt in zip(recommended_items, ground_truth_items)
+    ]
+    return float(np.mean(hits))
+
+
+# ==========================================================================
+# 4. 一次性计算所有指标（run_ablation.py 调用这个）
+# ==========================================================================
+
+def compute_all_metrics(
+    recommended_items:  Union[torch.Tensor, np.ndarray],
+    ground_truth_items: Union[torch.Tensor, np.ndarray],
+    closure_labels:     Union[dict, torch.Tensor, np.ndarray] = None,
     k: int = 10,
 ) -> dict:
     """
-    按用户群体分组计算NSR@K
+    一次返回所有指标。
 
-    Args:
-        user_groups: Dict[user_idx -> group_id(0-3)]
-
-    Returns:
-        Dict[group_id -> NSR@K]
+    返回
+    ----
+    {
+        "NDCG@K"  : float,
+        "Hit@K"   : float,
+        "NSR@K"   : float 或 None（若未提供 closure_labels）,
+        "K"       : int,
+    }
     """
-    group_recs = {g: [] for g in range(4)}
-    group_labels = {g: {} for g in range(4)}
+    results = {
+        "K":         k,
+        f"NDCG@{k}": ndcg_at_k(recommended_items, ground_truth_items, k),
+        f"Hit@{k}":  hit_at_k(recommended_items, ground_truth_items, k),
+        f"NSR@{k}":  None,
+    }
 
-    for user_idx, rec_list in enumerate(recommended_items):
-        g = user_groups.get(user_idx, 0)
-        local_idx = len(group_recs[g])
-        group_recs[g].append(rec_list)
-        if user_idx in closure_labels:
-            group_labels[g][local_idx] = closure_labels[user_idx]
+    if closure_labels is not None:
+        results[f"NSR@{k}"] = need_satisfaction_rate(
+            recommended_items, closure_labels, k
+        )
 
-    return {g: compute_nsr(group_recs[g], group_labels[g], k) for g in range(4)}
+    return results
