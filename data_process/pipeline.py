@@ -1,12 +1,25 @@
 import pandas as pd
+from tqdm import tqdm
 
+print("⏳ 读取 chained.csv...")
 df = pd.read_csv(r"D:\\社会计算\\taobao-project\\data\\processed\\chained.csv")
+print(f"✅ 数据读取完成，共 {len(df):,} 行")
 
-inter_df = df[["user_id", "item_id", "behavior_type", "timestamp"]].copy()
-inter_df = inter_df.rename(columns={"behavior_type": "label"})
+print("⏳ 提取交互数据...")
+inter = df[["user_idx", "item_idx", "behavior_code", "weight_final", "timestamp", "closure_label"]]
+inter.columns = ["user_id", "item_id", "label", "weight", "timestamp", "closure"]
 
-output_path = r"D:\社会计算\taobao-project\data\processed\taobao.inter"
-inter_df.to_csv(output_path, index=False)
+weight_to_behavior = {1.0: 0, 3.0: 1, 5.0: 2}
+inter["behavior"] = inter["weight"].map(weight_to_behavior)
 
-print(f"✅ 带时间戳的 taobao.inter 已生成！文件路径：\n{output_path}")
-print("文件字段：user_id, item_id, label(behavior_type), timestamp")
+print("⏳ 保存 taobao.inter...")
+inter.to_csv(
+    r"D:\社会计算\taobao-project\data\processed\taobao.inter",
+    sep="\t", index=False
+)
+
+print("✅ pipeline 完成 → taobao.inter 已生成 to C")
+print(f"📊 交互数据统计：")
+print(f"   - 用户数：{inter['user_id'].nunique():,}")
+print(f"   - 商品数：{inter['item_id'].nunique():,}")
+print(f"   - 交互数：{len(inter):,}")

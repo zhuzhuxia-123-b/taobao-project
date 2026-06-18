@@ -2,14 +2,10 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-raw_data_path = r"D:\\社会计算\\taobao-project\\data\\raw\\UserBehavior.csv"
+raw_data_path = r"D:\\社会计算\\taobao-project\\data\\raw\\user_behavior_sample.csv"
 processed_dir = r"D:\\社会计算\\taobao-project\\data\\processed"
 
-df = pd.read_csv(
-    raw_data_path,
-    names=["user_id", "item_id", "category_id", "behavior_type", "timestamp"],
-    header=None
-)
+df = pd.read_csv(raw_data_path)
 
 df = df.drop_duplicates()
 df = df.dropna()
