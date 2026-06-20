@@ -16,26 +16,21 @@ FIG_SAVE_DIR = os.path.join(BASE_DIR, "results", "figures")
 os.makedirs(FIG_SAVE_DIR, exist_ok=True)
 SAVE_BOX_PATH = os.path.join(FIG_SAVE_DIR, "decision_boxplot.png")
 SAVE_HEAT_PATH = os.path.join(FIG_SAVE_DIR, "transition_heatmap.png")
-
-# ===================== 1. 读取并清洗行为数据（按真实列名behavior_type处理） =====================
 df_behavior = pd.read_csv(CHAINED_CSV_PATH)
 df_behavior.columns = df_behavior.columns.str.strip().str.lower()
 print("行为表全部列名：", df_behavior.columns.tolist())
 
-# 真实行为字段是behavior_type，直接用它清洗
 df_behavior["action_clean"] = df_behavior["behavior_type"].str.strip().str.upper()
 df_behavior["event_time"] = pd.to_datetime(df_behavior["timestamp"])
 
 # 按用户+时间排序
 df_behavior = df_behavior.sort_values(["user_idx", "event_time"])
 print("行为类型取值：", df_behavior["action_clean"].unique())
-
-# ===================== 2. 读取并清洗用户分组数据 =====================
 df_user_group = pd.read_csv(USER_GROUP_CSV)
 df_user_group.columns = df_user_group.columns.str.strip().str.lower()
 print("分组表全部列名：", df_user_group.columns.tolist())
 
-# ===================== 3. 计算决策间隔（首次PV到首次Buy时长） =====================
+# 计算决策间隔（首次PV到首次Buy时长）
 def get_decision_gap(group_df):
     pv_mask = group_df["action_clean"] == "PV"
     buy_mask = group_df["action_clean"] == "BUY"
@@ -68,7 +63,7 @@ if len(user_gap_valid) > 0:
 else:
     print("提示：没有满足条件的有效数据，箱线图无法生成")
 
-# ===================== 4. 统计相邻行为转移、绘制热力图 =====================
+#  统计相邻行为转移、绘制热力图
 def calc_trans_matrix(group_df):
     actions = group_df["action_clean"].tolist()
     trans = {"PV→Cart": 0, "Cart→Buy": 0, "PV→Buy": 0}
