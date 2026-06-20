@@ -1,9 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-D Part: Demand State-based Reranking Strategy
-Four states: latent / exploring / intent / dormant
-Use chained.csv user behavior to judge state and rerank
-"""
 import pandas as pd
 
 CHAINED_CSV_PATH = "D:/社会计算/data/chained.csv"
