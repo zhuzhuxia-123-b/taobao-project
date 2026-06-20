@@ -1,0 +1,65 @@
+# 消融 D：完整模型 MB-GCL-SASRec（所有模块全开）
+# 用途：最终完整模型，作为消融实验的"上限"对照
+model: MBGCLSASRec
+dataset: taobao
+
+
+# 数据路径
+data_path: data_process/processed/
+
+# CPU 专属配置
+use_gpu: True
+gpu_id: 0
+worker: 0
+
+# 数据字段声明
+USER_ID_FIELD: user_id
+ITEM_ID_FIELD: item_id
+LABEL_FIELD: label
+TIME_FIELD: timestamp
+
+# 交互文件字段类型（需要额外字段支撑多行为）
+field_separator: "\t"
+load_col:
+  inter: [user_id, item_id, label, weight, timestamp, closure, behavior]
+# 序列设置
+MAX_ITEM_LIST_LENGTH: 50
+
+# 模型超参数
+embed_dim: 64
+n_layers: 2
+n_heads: 2
+max_seq_len: 50
+graph_layers: 2
+dropout: 0.1
+
+# 三路损失权重（完整模型全部开启）
+lambda1: 0.1          # 对比学习损失权重
+lambda2: 0.1          # 需求闭合损失权重
+temperature: 0.07     # InfoNCE 温度系数
+
+# 图数据路径（加上 taobao/）
+graph_pv_path:   data_process/processed/taobao/graph_pv.npz
+graph_cart_path: data_process/processed/taobao/graph_cart.npz
+graph_buy_path:  data_process/processed/taobao/graph_buy.npz
+
+# 评估设置
+eval_args:
+  split: {RS: [0.8, 0.1, 0.1]}
+  order: TO
+  group_by: user
+  mode: {valid: uni10, test: uni10}
+metrics: [NDCG, Hit, Recall]
+topk: [10]
+valid_metric: NDCG@10
+
+# 训练设置
+epochs: 30
+train_batch_size: 2048
+eval_batch_size: 512
+learning_rate: 0.001
+stopping_step: 10
+
+# 日志
+log_wandb: False
+show_progress: True

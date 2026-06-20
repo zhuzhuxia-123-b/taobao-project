@@ -1,0 +1,53 @@
+# 消融 A：ItemKNN 基线
+# 纯协同过滤，无序列建模，无图，无对比学习
+# 用途：验证"序列建模"的必要性
+
+model: ItemKNN
+dataset: taobao
+
+# 数据路径
+data_path: data_process/processed/
+
+# CPU 专属配置
+use_gpu: True
+gpu_id: 0
+worker: 0
+
+# 数据字段声明（对应 taobao.inter 的列名）
+USER_ID_FIELD: user_id
+ITEM_ID_FIELD: item_id
+LABEL_FIELD: label
+TIME_FIELD: timestamp
+
+# 交互文件字段类型
+field_separator: "\t"
+load_col:
+  inter: [user_id, item_id, label, weight, timestamp, closure, behavior]
+
+# 过滤低频物品/用户，大幅降低相似度矩阵规模（关键！）
+# 160万物品中绝大多数交互次数极少，过滤后矩阵规模可缩小一个量级
+user_inter_num_interval: "[5,inf)"
+item_inter_num_interval: "[5,inf)"
+
+# ItemKNN 参数
+k: 50          # 邻居数从100减到50，降低相似度矩阵稠密度
+shrink: 10.0   # 增大shrink，增加稀疏化程度
+
+# 评估设置
+eval_args:
+  split: {RS: [0.8, 0.1, 0.1]}
+  order: RO
+  group_by: user
+  mode: {valid: uni10, test: uni10}
+metrics: [NDCG, Hit, Recall]
+topk: [10]
+valid_metric: NDCG@10
+
+# 训练设置
+epochs: 1                  # ItemKNN 无需迭代训练
+train_batch_size: 512
+eval_batch_size: 64
+
+# 日志
+log_wandb: False
+show_progress: True
