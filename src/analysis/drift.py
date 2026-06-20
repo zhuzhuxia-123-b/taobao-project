@@ -1,24 +1,18 @@
 import numpy as np
-
 if not hasattr(np, "float"):
     np.float = np.float64
 if not hasattr(np, "float_"):
     np.float_ = np.float64
-
 if not hasattr(np, "complex"):
     np.complex = np.complex128
 if not hasattr(np, "complex_"):
     np.complex_ = np.complex128
-
 if not hasattr(np, "int"):
     np.int = np.int64
 if not hasattr(np, "int_"):
     np.int_ = np.int64
-
 if not hasattr(np, "bool_"):
     np.bool_ = np.bool8
-# ==========================================================================================
-
 import sys
 from pathlib import Path
 import torch
@@ -26,14 +20,11 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import scipy.sparse as sp
-
-# ---------------------- 项目路径配置 + 清理旧缓存 + 导入模型 ----------------------
 CURR_FILE = Path(__file__)
 # 定位项目根目录
 PROJECT_ROOT = CURR_FILE.parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# 清理历史recbole模块缓存
 for key in list(sys.modules.keys()):
     if key.startswith("recbole"):
         del sys.modules[key]
@@ -44,8 +35,6 @@ from src.model.mb_gcl_sasrec import MBGCLSASRec, _cfg_get
 # 仅引入RecBole父类依赖，不触发全局扫描
 import recbole
 print("当前使用的recbole路径：", recbole.__file__)
-
-# ---------------------- 业务常量配置 ----------------------
 WEIGHT_FILE = "MBGCLSASRec-Jun-15-2026_16-51-24.pth"
 MODEL_WEIGHT_PATH = PROJECT_ROOT / "saved" / WEIGHT_FILE
 CHAINED_CSV = PROJECT_ROOT / "data" / "chained.csv"
@@ -64,7 +53,6 @@ plt.rcParams["axes.unicode_minus"] = False
 MAX_SEQ_LEN = 50
 USE_SIMULATE_DATA = False
 
-# 【核心修改：维度和图文件对齐】
 MODEL_HPARAM = {
     "n_users": 1018012,
     "n_items": 5163071,
@@ -134,7 +122,7 @@ def load_model_with_graph():
     model.lambda1 = _cfg_get(MODEL_HPARAM, "lambda1", 0.1)
     model.lambda2 = _cfg_get(MODEL_HPARAM, "lambda2", 0.1)
 
-    # 3. 手动将训练权重复制到模型嵌入层前N行（核心，规避维度报错）
+    # 3. 手动将训练权重复制到模型嵌入层前N行（规避维度报错）
     model.user_emb_table.weight.data[:987995, :] = state_dict["user_emb_table.weight"]
     model.behavior_emb.item_emb.weight.data[:4162025, :] = state_dict["behavior_emb.item_emb.weight"]
 
